@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
+	"github.com/sirupsen/logrus"
 	"io"
 	"k8s-tunnel/pkg/utils"
 	"log"
@@ -60,11 +61,8 @@ func (gw *Gateway) Serve(ctx context.Context) error {
 func (gw *Gateway) NewRouter() *mux.Router {
 	r := mux.NewRouter()
 	r.HandleFunc("/agents/{agentName}/register", gw.registerHandler)
-
 	r.PathPrefix("/proxies/{agentName}").HandlerFunc(gw.requestHandler)
-
-	r.HandleFunc("/test", gw.testHandler)
-	r.HandleFunc("/read-test", gw.readTestHandler)
+	r.HandleFunc("/agents/{agentName}/response", gw.responseHandler)
 
 	return r
 }
@@ -76,7 +74,7 @@ func (gw *Gateway) registerHandler(writer http.ResponseWriter, request *http.Req
 	}
 
 	agentName := mux.Vars(request)["agentName"]
-	if _, ok := gw.getTunnel(agentName); ok {
+	if _, ok := gw.getTunnel(request); ok {
 		return
 	}
 
@@ -102,20 +100,70 @@ func (gw *Gateway) registerHandler(writer http.ResponseWriter, request *http.Req
 	fmt.Printf("%s registerd\n", agentName)
 }
 
+func (gw *Gateway) responseHandler(writer http.ResponseWriter, request *http.Request) {
+	if err := gw.authenticate(request); err != nil {
+		RESP(writer, NewStatusErr(http.StatusUnauthorized, err))
+		return
+	}
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:   1024,
+		WriteBufferSize:  1024,
+		HandshakeTimeout: time.Second * 30,
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
+
+	requestID := request.Header.Get(utils.HttpRequestIdHeader)
+
+	onceConn, err := upgrader.Upgrade(writer, request, nil)
+	if err != nil {
+		panic(err)
+	}
+	defer onceConn.Close()
+
+	logrus.Debugf("once conn comming, requestID:%s", requestID)
+
+	tunnel, ok := gw.getTunnel(request)
+	if !ok {
+		RESP(writer, NewStatusErr(http.StatusInternalServerError, fmt.Errorf("cant't get tunnel")))
+		return
+	}
+
+	rt, err := tunnel.GetRequestTransit(requestID)
+	if err != nil {
+		RESP(writer, NewStatusErr(http.StatusConflict, err))
+		return
+	}
+	logrus.Debugf("loading rt, requestID:%s", requestID)
+
+	if err = rt.Transit(onceConn); err != nil {
+		RESP(writer, NewStatusErr(http.StatusInternalServerError, err))
+		return
+	}
+
+	if err = rt.Response(onceConn); err != nil {
+		RESP(writer, NewStatusErr(http.StatusInternalServerError, err))
+		return
+	}
+
+	tunnel.DeleteRequestTransit(requestID)
+}
+
 func (gw *Gateway) requestHandler(writer http.ResponseWriter, request *http.Request) {
 	if err := gw.authenticate(request); err != nil {
 		RESP(writer, NewStatusErr(http.StatusUnauthorized, err))
 		return
 	}
 
-	agentName := mux.Vars(request)["agentName"]
-	tunnel, ok := gw.getTunnel(agentName)
+	tunnel, ok := gw.getTunnel(request)
 	if !ok {
 		RESP(writer, NewStatusErr(http.StatusInternalServerError, fmt.Errorf("cant't get tunnel")))
 		return
 	}
 
-	resp, err := tunnel.HandlerRequest(request)
+	resp, err := tunnel.HandleRequest(request)
+	defer resp.Body.Close()
 	if err != nil {
 		RESP(writer, NewStatusErr(http.StatusGone, err))
 		if utils.IsBrokenPipe(err) {
@@ -123,7 +171,6 @@ func (gw *Gateway) requestHandler(writer http.ResponseWriter, request *http.Requ
 		}
 		return
 	}
-	defer resp.Body.Close()
 
 	gw.response(resp, writer)
 }
@@ -153,11 +200,13 @@ func (gw *Gateway) initTunnel(agentName string, conn *websocket.Conn) *Tunnel {
 	}
 
 	go tunnel.SendPing()
+	go tunnel.Recv()
 
 	return tunnel
 }
 
-func (gw *Gateway) getTunnel(agentName string) (*Tunnel, bool) {
+func (gw *Gateway) getTunnel(request *http.Request) (*Tunnel, bool) {
+	agentName := mux.Vars(request)["agentName"]
 	v, ok := gw.tunnelMap.Load(agentName)
 	if !ok {
 		return nil, false

@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -33,6 +31,30 @@ func NewTunnel(agentName string, conn *websocket.Conn, gateway *Gateway) *Tunnel
 	}
 }
 
+func (t *Tunnel) Recv() {
+	for {
+		select {
+		case <-t.done:
+			return
+		default:
+			_, _, err := t.conn.NextReader()
+			defer func() {
+				if r := recover(); r != nil {
+					logrus.Errorf("NextReader panic: %v", r)
+					t.Close()
+				}
+			}()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					logrus.Errorf("recv message error. err:%v", err)
+					t.Close()
+					return
+				}
+			}
+		}
+	}
+}
+
 // 向客户端发送 ping
 // WriteControl 可以针对每种数据类型，进行设置write deadline
 func (t *Tunnel) SendPing() {
@@ -58,9 +80,7 @@ func (t *Tunnel) SendPing() {
 // 处理客户端返回 pong
 func (t *Tunnel) PongHandler() {
 	t.conn.SetPongHandler(func(appData string) error {
-		// 由于业务的特殊性，不用设置读超时
-		//return t.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		return nil
+		return t.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	})
 }
 
@@ -69,10 +89,6 @@ func (t *Tunnel) PongHandler() {
 func (t *Tunnel) CloseClientHandler() {
 	t.conn.SetCloseHandler(func(code int, str string) error {
 		t.Close()
-		//t.gateway.tunnelMap.Delete(t.agentName)
-		//// 当关闭的时候，让协程退出
-		//close(t.done)
-		//fmt.Println("tunnel close")
 		return nil
 	})
 }
@@ -86,49 +102,41 @@ func (t *Tunnel) Close() {
 	fmt.Printf("%s tunnel closed.\n", t.Name)
 }
 
-func (t *Tunnel) HandlerRequest(req *http.Request) (*http.Response, error) {
-	w, err := t.conn.NextWriter(websocket.BinaryMessage)
-	if err != nil {
-		fmt.Println("NextWriter error")
-		return nil, err
-	}
-
+func (t *Tunnel) HandleRequest(req *http.Request) (*http.Response, error) {
+	var (
+		requestID = uuid.New().String()
+		rt *TunnelRequestTransit
+	)
 	{
 		// requestID
-		requestID := uuid.New().String()
-		t.requests.Store(requestID, req)
 		req.Header.Add(utils.HttpRequestIdHeader, requestID)
+		rt = NewTunnelRequestTransit(requestID, req)
+		t.requests.Store(requestID, rt)
 	}
 
-	// 将 request 全量发送到客户端
-	if err = req.Write(w); err != nil {
-		fmt.Println("write error")
+	if err := t.conn.WriteMessage(websocket.TextMessage, []byte(requestID)); err != nil {
+		logrus.Errorf("requestID:%s, path:%s, write error. err:%v", requestID, req.URL.Path, err)
 		return nil, err
 	}
+	logrus.Debugf("translate request, requestID:%s, path:%s", requestID, req.URL.Path)
 
-	if err = w.Close(); err != nil {
-		return nil, err
+	resp := <- rt.RESP
+
+	logrus.Debugf("get response from agent, requestID:%s", requestID)
+	return resp, nil
+}
+
+func (t *Tunnel) GetRequestTransit(requestID string) (*TunnelRequestTransit, error) {
+	tr, ok := t.requests.Load(requestID)
+	if !ok {
+		return nil, fmt.Errorf("requestID:%s not exist", requestID)
 	}
 
-	// read
-	_, reader, err := t.conn.NextReader()
-	if err != nil {
-		fmt.Println("NextReader error")
-		return nil, err
-	}
+	return tr.(*TunnelRequestTransit), nil
+}
 
-	b, _ := ioutil.ReadAll(reader)
-	buf := bytes.NewReader(b)
-	return http.ReadResponse(bufio.NewReader(buf), req)
-	//requestID := resp.Header.Get(utils.HttpRequestIdHeader)
-	//request, ok := t.requests.Load(requestID)
-	//if !ok {
-	//	return nil, fmt.Errorf("requestID:%s invalid", requestID)
-	//}
-	//resp.Request = request.(*http.Request)
-
-	//return resp, nil
-	//return t.RESPTest(reader)
+func (t *Tunnel) DeleteRequestTransit(requestID string) {
+	t.requests.Delete(requestID)
 }
 
 /***test func***/

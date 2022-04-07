@@ -11,11 +11,9 @@ func main() {
 		Run: func(cmd *cobra.Command, args []string) {
 			agentName := "huawei" // args[0]
 			gatewayHost := "127.0.0.1:9991" // args[1]
-			endpointURL := "http://127.0.0.1:80" // args[2] 反向代理端
 			agent := NewAgent(&Option{
 				AgentName:   agentName,
 				GatewayHost: gatewayHost,
-				EndpointURL: endpointURL,
 			})
 			agent.Serve()
 		},

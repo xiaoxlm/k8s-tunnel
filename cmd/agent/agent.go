@@ -29,13 +29,10 @@ type Agent struct {
 	GatewayHost string
 	conn        *websocket.Conn
 	done        chan struct{}
-	EndpointURL string // 反向代理端
-	//httpHandler http.Handler
 }
 
 type Option struct {
 	AgentName   string
-	EndpointURL string // 反向代理端
 	GatewayHost string // websocket 服务端
 }
 
@@ -43,7 +40,6 @@ func NewAgent(opt *Option) *Agent {
 	a := &Agent{
 		AgentName:   opt.AgentName,
 		GatewayHost: opt.GatewayHost,
-		EndpointURL: opt.EndpointURL,
 		done:        make(chan struct{}),
 	}
 
@@ -81,51 +77,30 @@ func (a *Agent) Serve() {
 
 func (a *Agent) HandleRequest() error {
 	conn := a.GetConn()
-	typ, rd, err := conn.NextReader()
+	messageType, message, err := conn.ReadMessage()
 	if err != nil {
 		return err
 	}
-	if typ != websocket.BinaryMessage {
-
+	switch messageType {
+	case websocket.BinaryMessage:
+		return nil
+	case websocket.CloseMessage:
+		return nil
+	case websocket.PingMessage:
+		return nil
+	case websocket.PongMessage:
+		return nil
 	}
-	// 拿到request
-	var (
-		req *http.Request
-	)
-	{
-		req, err = http.ReadRequest(bufio.NewReader(rd))
-		if err != nil {
-			return err
+
+	go func(requestID string) {
+		logrus.Debugf("agent get requestID: %s", requestID)
+		ctx := context.Background()
+		if err = a.response(ctx, requestID); err != nil {
+			logrus.Errorf("response error. requestID:%s, err:%v", requestID, err)
 		}
-		// 这里是硬编码
-		req.URL.Path = a.trimPath(req.URL.Path)
+	}(string(message))
 
-		logrus.Debugf("get reqest. requestID:%s, path:%s", req.Header.Get(utils.HttpRequestIdHeader), req.URL.Path)
-		//token := req.Header.Get("Token")
-	}
-
-	var (
-		rw http.ResponseWriter
-		buf = &bytes.Buffer{}
-	)
-	{
-
-		rw = NewResponseWriter(buf)
-		rw.Header().Set(utils.HttpRequestIdHeader, req.Header.Get(utils.HttpRequestIdHeader))
-	}
-
-	if a.EndpointURL != "" {
-		u, err := url.Parse(a.EndpointURL)
-		if err != nil {
-			panic(err)
-		}
-		httpHandler := ReverseProxyHandler(u.Scheme, u.Host)
-		httpHandler.ServeHTTP(rw, req)
-	}
-
-	//a.httpHandler = new(TestHandler)
-
-	return conn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
+	return nil
 }
 
 func (a *Agent) GetConn() *websocket.Conn {
@@ -191,6 +166,77 @@ func (a *Agent) connect() {
 		logrus.Errorf("register invalid. err:%v", err)
 		return
 	}
+}
+
+func (a *Agent) response(ctx context.Context, requestID string) error {
+	path := fmt.Sprintf("/agents/%s/response", a.AgentName)
+	u := url.URL{Scheme: "ws", Host: a.GatewayHost, Path: path}
+
+	header := http.Header{}
+	header.Add(utils.HttpRequestIdHeader, requestID)
+
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, u.String(), header)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err = conn.Close(); err != nil {
+			logrus.Errorf("response conn close error. err:%v", err)
+			return
+		}
+	}()
+	logrus.Debugf("start response conn, requestID:%s", requestID)
+
+	// get k8s request
+	var (
+		req *http.Request // k8s request
+	)
+	{
+		req, err = a.parseK8sRequest(conn)
+		if err != nil {
+			return err
+		}
+	}
+
+	// write
+	var (
+		rw http.ResponseWriter
+		buf = &bytes.Buffer{}
+	)
+	{
+		rw = NewResponseWriter(buf)
+		rw.Header().Set(utils.HttpRequestIdHeader, requestID)
+	}
+
+	httpHandler, err := K8sReverseProxyHandler()
+	if err != nil {
+		return err
+	}
+	httpHandler.ServeHTTP(rw, req)
+	err = conn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
+
+	logrus.Debugf("agent write back k8s request, requestID:%s", requestID)
+	return err
+}
+
+func (a *Agent) parseK8sRequest(onceConn *websocket.Conn) (*http.Request, error) {
+	typ, message, err := onceConn.ReadMessage()
+	if err != nil {
+		logrus.Errorf("conn ReadMessage error. err:%v", err)
+		return nil, err
+	}
+	if typ != websocket.BinaryMessage {
+		return nil, fmt.Errorf("type is not binary")
+	}
+
+	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(message)))
+	if err != nil {
+		logrus.Errorf("ReadRequest error. err:%v", err)
+		return nil, err
+	}
+	req.URL.Path = a.trimPath(req.URL.Path)
+	logrus.Debugf("agent get reqest requestID:%s, path:%s", req.Header.Get(utils.HttpRequestIdHeader), req.URL.Path)
+	return req, nil
 }
 
 func (a *Agent) trimPath(path string) string {
