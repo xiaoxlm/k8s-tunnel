@@ -1,0 +1,4 @@
+.idea/
+tests/
+cmd/agent/agent
+cmd/server/server
